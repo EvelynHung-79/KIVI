@@ -1,0 +1,82 @@
+@startuml
+title KIVI Repository - Key Class Diagram (main branch)
+
+' --- Settings for readability ---
+skinparam classAttributeIconSize 0
+skinparam package {
+    BorderColor #555555
+    BackgroundColor #F8F8F8
+}
+
+' --- Package for Evaluation Scripts (The "Clients") ---
+package "Evaluation Scripts" {
+  class "eval_long_bench.py" as EvalLongBench
+  class "mem_spd_test.py" as MemTest
+  class "example.py" as Example
+}
+
+' --- Package for Core KIVI Logic (models/utils_quant.py) ---
+package "Core KIVI Logic" {
+  class Quantizer {
+    +__init__(bits, group_size, ...)
+    +quant(x)
+    +dequant(x)
+  }
+}
+
+' --- Package for the Llama Model (models/llama_kivi.py) ---
+package "Llama Model (Duplicated)" {
+  class LlamaForCausalLM_KIVI {
+    +model: LlamaModel_KIVI
+    +forward(...)
+  }
+  class LlamaModel_KIVI {
+    +layers: LlamaAttention_KIVI[]
+    +forward(...)
+  }
+  class LlamaAttention_KIVI {
+    +k_quant: Quantizer
+    +v_quant: Quantizer
+    +forward(...)
+  }
+}
+
+' --- Package for the Mistral Model (models/mistral_kivi.py) ---
+package "Mistral Model (Duplicated)" {
+  class MistralForCausalLM_KIVI {
+    +model: MistralModel_KIVI
+    +forward(...)
+  }
+  class MistralModel_KIVI {
+    +layers: MistralAttention_KIVI[]
+    +forward(...)
+  }
+  class MistralAttention_KIVI {
+    +k_quant: Quantizer
+    +v_quant: Quantizer
+    +forward(...)
+  }
+}
+
+' --- Relationships ---
+
+' Client scripts use the models
+EvalLongBench ..> LlamaForCausalLM_KIVI : "uses"
+MemTest ..> LlamaForCausalLM_KIVI : "uses"
+Example ..> LlamaForCausalLM_KIVI : "uses"
+EvalLongBench ..> MistralForCausalLM_KIVI : "uses"
+MemTest ..> MistralForCausalLM_KIVI : "uses (modified)"
+Example ..> MistralForCausalLM_KIVI : "uses"
+
+' Model composition
+LlamaForCausalLM_KIVI *-- "1" LlamaModel_KIVI
+LlamaModel_KIVI *-- "N" LlamaAttention_KIVI : "layers"
+
+MistralForCausalLM_KIVI *-- "1" MistralModel_KIVI
+MistralModel_KIVI *-- "N" MistralAttention_KIVI : "layers"
+
+' KIVI logic aggregation
+LlamaAttention_KIVI o--> "k_quant, v_quant" Quantizer
+MistralAttention_KIVI o--> "k_quant, v_quant" Quantizer
+
+@enduml
