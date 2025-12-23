@@ -49,6 +49,15 @@ conda create -n kivi python=3.10
 conda activate kivi
 pip install --upgrade pip  # enable PEP 660 support
 pip install -e .
+
+# MINE
+python3.11 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip setuptools wheel packaging ninja psutil
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install flash-attn==2.5.6 --no-build-isolation
+pip install -e . --no-build-isolation
+
 ```
 
 Then install our CUDA implementation:
