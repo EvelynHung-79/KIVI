@@ -29,11 +29,16 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
+from quant.cache_manager import KiviCacheManager, KiviCacheState
 from quant.new_pack import triton_quantize_and_pack_along_last_dim
 from quant.matmul import cuda_bmm_fA_qB_outer
 
 from transformers.models.mistral.configuration_mistral import *
 from transformers.models.mistral.modeling_mistral import *
+from transformers.models.mistral.modeling_mistral import (
+    apply_rotary_pos_emb,
+    repeat_kv
+)
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 
 _CONFIG_FOR_DOC = "MistralConfig"
@@ -88,6 +93,10 @@ class MistralAttention_KIVI(nn.Module):
         self.group_size = config.group_size
         self.residual_length = config.residual_length
 
+        self.kivi_manager = KiviCacheManager(
+            config.k_bits, config.v_bits, config.group_size, config.residual_length
+        )
+
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
@@ -131,63 +140,47 @@ class MistralAttention_KIVI(nn.Module):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        cache = KiviCacheState.from_tuple(past_key_value)
+
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
-            kv_seq_len += past_key_value[-1]
+            kv_seq_len += cache.current_length # 改用物件屬性
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
-            key_states_quant_trans = past_key_value[0]
-            key_states_full = past_key_value[1]
-            key_scale_trans = past_key_value[2]
-            key_mn_trans = past_key_value[3]
-            value_states_quant = past_key_value[4]
-            value_states_full = past_key_value[5]
-            value_scale = past_key_value[6]
-            value_mn = past_key_value[7]
-
-            if key_states_quant_trans is not None:
-                # import ipdb; ipdb.set_trace()
-                key_states_quant_trans_repeat = repeat_kv_quant(key_states_quant_trans, self.num_key_value_groups)
-                key_scale_trans_repeat = repeat_kv_quant(key_scale_trans, self.num_key_value_groups)
-                key_mn_trans_repeat = repeat_kv_quant(key_mn_trans, self.num_key_value_groups)
-                att_qkquant = cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_trans_repeat, 
-                                key_scale_trans_repeat, key_mn_trans_repeat, self.k_bits) # key_states_quant_trans, key_scale_trans, key_mn_trans need to be repeated
+            self.kivi_manager.update_key_state(cache, key_states, is_prefill=False)
+            
+            # 2.1 量化部分
+            if cache.key_quant is not None:
+                # Repeat KV for GQA
+                key_quant_rep = repeat_kv_quant(cache.key_quant, self.num_key_value_groups)
+                key_scale_rep = repeat_kv_quant(cache.key_scale, self.num_key_value_groups)
+                key_zp_rep = repeat_kv_quant(cache.key_zero_point, self.num_key_value_groups)
+                
+                att_qkquant = cuda_bmm_fA_qB_outer(self.group_size, query_states, key_quant_rep, 
+                                                   key_scale_rep, key_zp_rep, self.k_bits)
             else:
                 att_qkquant = None
 
-            if key_states_full is not None:
-                key_states_full = torch.cat([key_states_full, key_states], dim=2)
+            # 2.2 全精度部分
+            if cache.key_full is not None:
+                # Repeat KV for GQA
+                key_full_rep = repeat_kv(cache.key_full, self.num_key_value_groups)
+                att_qkfull = torch.matmul(query_states, key_full_rep.transpose(2, 3))
             else:
-                key_states_full = key_states
+                att_qkfull = None
             
-            key_states_full_repeat = repeat_kv(key_states_full, self.num_key_value_groups)
-            att_qkfull = torch.matmul(query_states, key_states_full_repeat.transpose(2, 3)) # key_states_full need to be repeated
-            if att_qkquant is not None:
-                attn_weights = torch.cat([att_qkquant, att_qkfull], dim=-1) / math.sqrt(self.head_dim)
-            else:
-                attn_weights = att_qkfull / math.sqrt(self.head_dim)
-
-            if key_states_full.shape[-2] == self.residual_length:
-                key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = triton_quantize_and_pack_along_last_dim(key_states_full.transpose(2, 3).contiguous(), 
-                                                                                                                            self.group_size, 
-                                                                                                                            self.k_bits)
-                key_states_full = None
-                if key_states_quant_trans is not None:
-                    key_states_quant_trans = torch.cat([key_states_quant_trans, key_states_quant_trans_new], dim=3)
-                    key_scale_trans = torch.cat([key_scale_trans, key_scale_trans_new], dim=3)
-                    key_mn_trans = torch.cat([key_mn_trans, key_mn_trans_new], dim=3)
+            # 合併 Attention Scores
+            if att_qkfull is not None:
+                if att_qkquant is not None:
+                    attn_weights = torch.cat([att_qkquant, att_qkfull], dim=-1)
                 else:
-                    key_states_quant_trans = key_states_quant_trans_new
-                    key_scale_trans = key_scale_trans_new
-                    key_mn_trans = key_mn_trans_new
-
-            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                    f" {attn_weights.size()}"
-                )
+                    attn_weights = att_qkfull
+            else:
+                attn_weights = att_qkquant
+            
+            attn_weights = attn_weights / math.sqrt(self.head_dim)
 
             if attention_mask is not None:
                 if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
@@ -199,75 +192,39 @@ class MistralAttention_KIVI(nn.Module):
                     attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)
                 )
 
-            # upcast attention to fp32
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-            value_states_full = torch.cat([value_states_full, value_states], dim=2)
-            value_full_length = value_states_full.shape[-2]
-            if value_states_quant is None:
-                value_states_full_repeat = repeat_kv(value_states_full, self.num_key_value_groups)
-                attn_output = torch.matmul(attn_weights, value_states_full_repeat) # value_states_full need to be repeated
+            # [Step 3] 更新 Value Cache (委派給 Manager)
+            self.kivi_manager.update_value_state(cache, value_states, is_prefill=False)
+            
+            # [Step 4] 計算 Attention Output (Value 部分)
+            value_full_len = cache.value_full.shape[-2] if cache.value_full is not None else 0
+            
+            if cache.value_quant is None:
+                # Repeat KV
+                val_full_rep = repeat_kv(cache.value_full, self.num_key_value_groups)
+                attn_output = torch.matmul(attn_weights, val_full_rep)
             else:
-                value_states_quant_repeat = repeat_kv_quant(value_states_quant, self.num_key_value_groups)
-                value_scale_repeat = repeat_kv_quant(value_scale, self.num_key_value_groups)
-                value_mn_repeat = repeat_kv_quant(value_mn, self.num_key_value_groups)
-                attn_output = cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length], value_states_quant_repeat, 
-                                                value_scale_repeat, value_mn_repeat, self.v_bits) # value_states_quant, value_scale, value_mn need to be repeated
+                # 準備量化部分的 Repeat
+                val_quant_rep = repeat_kv_quant(cache.value_quant, self.num_key_value_groups)
+                val_scale_rep = repeat_kv_quant(cache.value_scale, self.num_key_value_groups)
+                val_zp_rep = repeat_kv_quant(cache.value_zero_point, self.num_key_value_groups)
                 
-                value_states_full_repeat = repeat_kv(value_states_full, self.num_key_value_groups)
-                attn_output += torch.matmul(attn_weights[:, :, :, -value_full_length:], value_states_full_repeat) # value_states_full need to be repeated
-
-            if value_states_full.shape[-2] > self.residual_length:
-                assert value_states_full.shape[-2] == self.residual_length + 1
-                value_states_quant_new, scale, mn = triton_quantize_and_pack_along_last_dim(value_states_full[:, :, :1, :].contiguous(), 
-                                                                                                self.group_size, 
-                                                                                                self.v_bits)
-                value_states_full = value_states_full[:, :, 1:, :].contiguous()
-                if value_states_quant is not None:
-                    value_states_quant = torch.cat([value_states_quant, value_states_quant_new], dim=2)
-                    value_scale = torch.cat([value_scale, scale], dim=2)
-                    value_mn = torch.cat([value_mn, mn], dim=2)
+                if value_full_len > 0:
+                    val_full_rep = repeat_kv(cache.value_full, self.num_key_value_groups)
+                    
+                    attn_output = cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_len], 
+                                                       val_quant_rep, val_scale_rep, val_zp_rep, self.v_bits)
+                    attn_output += torch.matmul(attn_weights[:, :, :, -value_full_len:], val_full_rep)
                 else:
-                    value_states_quant = value_states_quant_new
-                    value_scale = scale
-                    value_mn = mn
+                    attn_output = cuda_bmm_fA_qB_outer(self.group_size, attn_weights, 
+                                                       val_quant_rep, val_scale_rep, val_zp_rep, self.v_bits)
         
         else:
-
-            # quantize
-            if key_states.shape[-2] % self.residual_length != 0:
-                if key_states.shape[-2] < self.residual_length:
-                    key_states_quant = None
-                    key_states_full = key_states
-                else:
-                    key_states_quant = key_states[:, :, :-(key_states.shape[-2] % self.residual_length), :].contiguous()
-                    key_states_full = key_states[:, :, -(key_states.shape[-2] % self.residual_length):, :].contiguous()
-            else:
-                key_states_quant = key_states
-                key_states_full = None
-            if key_states_quant is not None:
-                key_states_quant_trans, key_scale_trans, key_mn_trans = triton_quantize_and_pack_along_last_dim(key_states_quant.transpose(2, 3).contiguous(), self.group_size, self.k_bits)
-            else:
-                key_states_quant_trans = None
-                key_scale_trans = None
-                key_mn_trans = None
+            key_states_rep = repeat_kv(key_states, self.num_key_value_groups)
+            value_states_rep = repeat_kv(value_states, self.num_key_value_groups)
             
-            if value_states.shape[-2] <= self.residual_length:
-                value_states_quant = None
-                value_states_full = value_states
-                value_scale = None
-                value_mn = None
-            else:
-                value_states_quant = value_states[:, :, :-self.residual_length, :].contiguous()
-                value_states_full = value_states[:, :, -self.residual_length:, :].contiguous()
-                value_states_quant, value_scale, value_mn = triton_quantize_and_pack_along_last_dim(value_states_quant, 
-                                                                                                self.group_size, 
-                                                                                                self.v_bits)
-        
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
-            attn_weights = torch.matmul(query_states, 
-                                        key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            attn_weights = torch.matmul(query_states, key_states_rep.transpose(2, 3)) / math.sqrt(self.head_dim)
 
             if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
                 raise ValueError(
@@ -290,8 +247,16 @@ class MistralAttention_KIVI(nn.Module):
                 attn_weights, dim=-1, dtype=torch.float32
             ).to(query_states.dtype)
 
-            attn_output = torch.matmul(attn_weights, value_states) 
-        past_key_value = (key_states_quant_trans, key_states_full, key_scale_trans, key_mn_trans, value_states_quant, value_states_full, value_scale, value_mn, kv_seq_len) if use_cache else None
+            attn_output = torch.matmul(attn_weights, value_states_rep)
+
+            # [Refactoring] 批量更新 Cache (一行代碼搞定！)
+            self.kivi_manager.update_key_state(cache, key_states, is_prefill=True)
+            self.kivi_manager.update_value_state(cache, value_states, is_prefill=True)
+            
+            # 更新長度
+            cache.current_length = key_states.shape[-2]
+        
+        past_key_value = cache.to_tuple() if use_cache else None
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"

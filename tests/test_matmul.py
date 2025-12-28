@@ -10,8 +10,7 @@ class TestMatMul(unittest.TestCase):
             self.skipTest("需要 CUDA 才能測試 Triton kernel")
         self.device = 'cuda'
         
-        # 定義維度: [Batch, Heads, M, K], [Batch, Heads, T, K]
-        # M=Query Length (Decoding=1), T=Key Length, K=Head Dim
+        # 定義維度: [Batch, Heads, M, K], [Batch, Heads, T, K] where M=Query Length (Decoding=1), T=Key Length, K=Head Dim
         self.B, self.nh, self.M, self.K = 1, 8, 1, 128 
         self.T = 128 
         
@@ -28,20 +27,16 @@ class TestMatMul(unittest.TestCase):
         print("Testing Triton Matmul Correctness...")
         
         # 1. 執行量化
-        # quant_and_pack_kcache 輸入 (B, nh, T, K)，壓縮 T 維度
-        # scale/mn 原始輸出形狀為 (B, nh, Groups, 1, K) <--- 注意這裡有 5 維
         code, scale, mn = quant_and_pack_kcache(self.k, self.group_size, self.bits)
         
         # 2. 準備 Matmul 輸入 (關鍵修正步驟)
-        # 我們需要將資料轉置成 Kernel 預期的 (B, nh, K, T_packed) 或 (B, nh, K, Groups)
-        
-        # 處理 Code: (B, nh, T_packed, K) -> (B, nh, K, T_packed)
-        code_trans = code.transpose(2, 3).contiguous()
-        
-        # 處理 Scale & Mn (修正 nan 的關鍵):
-        # 原始: (B, nh, Groups, 1, K)
-        # 目標: (B, nh, K, Groups)
-        # 步驟: squeeze(3) 去掉 1 -> (B, nh, Groups, K) -> transpose(2, 3) -> (B, nh, K, Groups)
+        # 原始 code 形狀: (B, nh, T_packed, K)
+        # 我們手動把它轉過來 (transpose): 
+        code_trans = code.transpose(2, 3).contiguous() 
+        # 現在變成了 (B, nh, K, T_packed) -> 機器人看得懂了！
+
+        # squeeze(3): 把那個沒用的 '1' 擠掉 -> 變成 (Groups, K)
+        # transpose(2, 3): 再轉置 -> 變成 (K, Groups)
         scale_trans = scale.squeeze(3).transpose(2, 3).contiguous()
         mn_trans = mn.squeeze(3).transpose(2, 3).contiguous()
 
@@ -56,10 +51,7 @@ class TestMatMul(unittest.TestCase):
         )
         
         # 4. 執行標準 PyTorch Matmul (Ground Truth)
-        # 使用原始的 code/scale/mn 進行解量化，確保解回來的資料形狀是 (B, nh, T, K)
         k_dequant = unpack_and_dequant_kcache(code, scale, mn, self.group_size, self.bits)
-        
-        # 標準運算: Q(..., 1, K) @ K_dequant.T(..., K, T)
         output_ref = torch.matmul(self.q, k_dequant.transpose(2, 3))
         
         # 5. 比較結果

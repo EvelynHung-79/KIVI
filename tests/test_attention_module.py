@@ -51,12 +51,12 @@ class TestLlamaAttentionKIVI(unittest.TestCase):
         hidden_states = torch.randn(
             self.batch_size, seq_len, self.config.hidden_size, device=self.device
         )
-        # [修正] 手動建立 position_ids
+
         position_ids = torch.arange(seq_len, dtype=torch.long, device=self.device).unsqueeze(0)
         
         output, _, past_key_value = self.attn(
             hidden_states=hidden_states,
-            position_ids=position_ids, # 傳入 position_ids
+            position_ids=position_ids,
             use_cache=True
         )
         
@@ -68,6 +68,7 @@ class TestLlamaAttentionKIVI(unittest.TestCase):
         
         kv_seq_len = past_key_value[-1]
         self.assertEqual(kv_seq_len, seq_len, f"KV sequence length should be {seq_len}")
+        
 
     @unittest.skipIf(not torch.cuda.is_available(), "KIVI 需要 CUDA 環境才能執行測試")
     def test_decoding_step(self):
@@ -77,12 +78,11 @@ class TestLlamaAttentionKIVI(unittest.TestCase):
         hidden_states_prefill = torch.randn(
             self.batch_size, prefill_len, self.config.hidden_size, device=self.device
         )
-        # [修正] Prefill 的 position_ids 為 0 ~ 9
         position_ids_prefill = torch.arange(prefill_len, dtype=torch.long, device=self.device).unsqueeze(0)
         
         _, _, past_key_value = self.attn(
             hidden_states=hidden_states_prefill, 
-            position_ids=position_ids_prefill, # 傳入
+            position_ids=position_ids_prefill, 
             use_cache=True
         )
         
@@ -90,12 +90,11 @@ class TestLlamaAttentionKIVI(unittest.TestCase):
         hidden_states_decode = torch.randn(
             self.batch_size, 1, self.config.hidden_size, device=self.device
         )
-        # [修正] Decoding 的 position_id 應為 [10] (接續 prefill)
         position_ids_decode = torch.tensor([[prefill_len]], dtype=torch.long, device=self.device)
         
         output, _, new_past_key_value = self.attn(
             hidden_states=hidden_states_decode,
-            position_ids=position_ids_decode, # 傳入
+            position_ids=position_ids_decode,
             past_key_value=past_key_value,
             use_cache=True
         )
@@ -114,7 +113,6 @@ class TestLlamaAttentionKIVI(unittest.TestCase):
         hidden_states = torch.randn(
             self.batch_size, target_len, self.config.hidden_size, device=self.device
         )
-        # [修正] 手動建立 position_ids
         position_ids = torch.arange(target_len, dtype=torch.long, device=self.device).unsqueeze(0)
         
         _, _, past_key_value = self.attn(
@@ -122,13 +120,11 @@ class TestLlamaAttentionKIVI(unittest.TestCase):
             position_ids=position_ids, # 傳入
             use_cache=True
         )
-        
         key_quant = past_key_value[0] 
         key_full = past_key_value[1] 
         
         self.assertIsNotNone(key_quant, "Quantized Key Cache should created when residual buffer is full")
         self.assertIsNone(key_full, "Full Precision Key Cache should be None (cleared) after quantization trigger")
-        
         print("  > Verified: Full cache cleared and Quantized cache created.")
 
     @unittest.skipIf(not torch.cuda.is_available(), "KIVI 需要 CUDA 環境才能執行測試")
@@ -138,18 +134,16 @@ class TestLlamaAttentionKIVI(unittest.TestCase):
         hidden_states = torch.randn(
             self.batch_size, seq_len, self.config.hidden_size, device=self.device
         )
-        # [修正] 手動建立 position_ids
         position_ids = torch.arange(seq_len, dtype=torch.long, device=self.device).unsqueeze(0)
 
         _, _, pkv = self.attn(
             hidden_states=hidden_states, 
-            position_ids=position_ids, # 傳入
+            position_ids=position_ids, 
             use_cache=True
         )
         
         self.assertIsNotNone(pkv[1], "idx 1 (key_states_full) should not be None for short seq")
         self.assertIsNotNone(pkv[5], "idx 5 (value_states_full) should not be None for short seq")
-        
         self.assertIsNone(pkv[0], "idx 0 (key_states_quant) should be None for short seq")
         self.assertIsNone(pkv[4], "idx 4 (value_states_quant) should be None for short seq")
         

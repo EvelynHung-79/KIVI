@@ -17,10 +17,8 @@ class TestQuantization(unittest.TestCase):
         print("Testing Key Cache Quantization...")
         # 1. 執行量化
         code, scale, mn = quant_and_pack_kcache(self.dummy_tensor, self.group_size, self.bits)
-        
         # 2. 執行解量化
         decoded = unpack_and_dequant_kcache(code, scale, mn, self.group_size, self.bits)
-        
         # 3. 驗證形狀
         self.assertEqual(decoded.shape, self.shape, "解壓縮後的形狀應該與原始輸入相同")
         
@@ -31,10 +29,14 @@ class TestQuantization(unittest.TestCase):
 
     def test_v_cache_quant_dequant(self):
         print("Testing Value Cache Quantization...")
+        # 1. 執行量化
         code, scale, mn = quant_and_pack_vcache(self.dummy_tensor, self.group_size, self.bits)
+        # 2. 執行解量化
         decoded = unpack_and_dequant_vcache(code, scale, mn, self.group_size, self.bits)
-        
+        # 3. 驗證形狀
         self.assertEqual(decoded.shape, self.shape)
+
+        # 4. 驗證誤差 (相對誤差不應過大，這裡設個寬鬆標準因為是 2-bit)
         error = torch.mean(torch.abs(decoded - self.dummy_tensor)).item()
         print(f"  > Mean Error: {error:.4f}")
         self.assertTrue(error < 0.5)

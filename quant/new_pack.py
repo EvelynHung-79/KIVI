@@ -4,6 +4,24 @@ import random
 import numpy as np
 import torch
 
+# [Refactoring] New Helper Function (提取共用邏輯)
+def _compute_quant_params(data: torch.Tensor, bits: int, dim: int):
+    """
+    Computes quantization parameters and quantized data (int32) for a given tensor.
+    """
+    max_int = 2 ** bits - 1
+    
+    # 1. Calculate Min/Max & Scale
+    mn = torch.min(data, dim=dim, keepdim=True)[0]
+    mx = torch.max(data, dim=dim, keepdim=True)[0]
+    scale = (mx - mn) / max_int
+    
+    # 2. Quantize
+    data = data - mn
+    data.div_(scale)
+    data = data.clamp_(0, max_int).round_().to(torch.int32)
+    
+    return data, scale, mn
 
 def quant_and_pack_kcache(k: torch.FloatTensor, group_size: int, bits: int):
 	assert len(k.shape) == 4
@@ -13,19 +31,15 @@ def quant_and_pack_kcache(k: torch.FloatTensor, group_size: int, bits: int):
 	assert T % group_size == 0
 	num_groups = T // group_size
 	new_shape = (B, nh, num_groups, group_size, D)
-	# Quantize
-	max_int = 2 ** bits - 1
+
+	# Quantize 
+	# [Refactored] Use Helper
 	data = k.view(new_shape)
-	mn = torch.min(data, dim=-2, keepdim=True)[0]
-	mx = torch.max(data, dim=-2, keepdim=True)[0]
-	scale =  (mx - mn) / max_int
-	data = data - mn
-	data.div_(scale)
-	data = data.clamp_(0, max_int).round_().to(torch.int32)
+	data, scale, mn = _compute_quant_params(data, bits, dim=-2) # Key 沿著 dim=-2 (Group) 量化
+
 	data = data.view(shape)
 	code = pack_tensor(data, bits, pack_dim=2)
 	return code, scale, mn
-
 
 def quant_and_pack_vcache(v: torch.FloatTensor, group_size: int, bits: int):
 	shape = v.shape
@@ -33,20 +47,16 @@ def quant_and_pack_vcache(v: torch.FloatTensor, group_size: int, bits: int):
 	assert v.shape[-1] % group_size == 0
 	num_groups = shape[-1] // group_size
 	new_shape = (shape[:-1] + (num_groups, group_size))
+	
 	# Quantize
-	max_int = 2 ** bits - 1
+	# [Refactored] Use Helper
 	data = v.view(new_shape)
-	mn = torch.min(data, dim=-1, keepdim=True)[0]
-	mx = torch.max(data, dim=-1, keepdim=True)[0]
-	scale = (mx - mn) / max_int
-	data = data - mn
-	data.div_(scale)
-	data = data.clamp_(0, max_int).round_().to(torch.int32)
+	data, scale, mn = _compute_quant_params(data, bits, dim=-1) # Value 沿著 dim=-1 (Last Dim) 量化
+
 	data = data.view(shape)
 	# Pack
 	code = pack_tensor(data, bits, pack_dim=3)
 	return code, scale, mn
-
 
 def unpack_and_dequant_kcache(k_code: torch.FloatTensor, 
 							  scale: torch.FloatTensor, 
@@ -64,7 +74,6 @@ def unpack_and_dequant_kcache(k_code: torch.FloatTensor,
 	data = data.to(torch.float16)
 	data = data * scale + mn 
 	return data.view(shape)
-
 	
 def unpack_and_dequant_vcache(v_code: torch.FloatTensor, 
 							  scale: torch.FloatTensor, 
@@ -81,7 +90,6 @@ def unpack_and_dequant_vcache(v_code: torch.FloatTensor,
 	data = data.to(torch.float16)
 	data = data * scale + mn 
 	return data.view(shape)
-
 
 def pack_tensor(data, bits, pack_dim):
 	# Pack
@@ -106,7 +114,6 @@ def pack_tensor(data, bits, pack_dim):
 		row += 1
 	return code
 
-
 def unpack_tensor(v_code: torch.FloatTensor, 
 				  bits: int, 
 				  pack_dim: int):
@@ -127,7 +134,6 @@ def unpack_tensor(v_code: torch.FloatTensor,
 	else:
 		raise NotImplementedError
 	return unpacked_v_code
-
 
 @triton.jit
 def _pack_along_last_dim(
@@ -152,8 +158,6 @@ def _pack_along_last_dim(
 		# Combine the value using bitwise OR
 		packed = packed | element
 	tl.store(code_ptr + offs_N * num_int_per_y_dim + yid, packed, mask=offs_N < N)
-
-
 
 @triton.jit
 def _minmax_along_last_dim(
